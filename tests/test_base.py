@@ -3,6 +3,15 @@ from torch.distributions.multivariate_normal import MultivariateNormal
 
 from torchmm.base import CategoricalModel
 from torchmm.base import DiagNormalModel
+from torchmm.base import MixedModel
+
+
+def test_mixed_model():
+    m = MixedModel(probs=torch.tensor([0.2, 0.2, 0.6]),
+                   mean=3.0, prec=0.5)
+    sample = m.sample(torch.tensor([1000]))
+
+    m.fit(sample)
 
 
 def test_categorical_model_sample():

@@ -77,6 +77,176 @@ class Model(object):
         raise NotImplementedError("set_parameters method not implemented")
 
 
+class MixedModel(Model):
+    def __init__(self, probs: Union[torch.Tensor, int],
+                 mean: float,
+                 prec: float = 1,
+                 prior: Union[float, torch.Tensor] = 1,
+                 means_prior: float = 0,
+                 n0: int = 1,
+                 prec_alpha_prior: Union[torch.Tensor, float] = 1,
+                 prec_beta_prior: Union[torch.Tensor, float] = 1,
+                 device: str = "cpu"):
+
+        if isinstance(probs, int):
+            probs = torch.ones(probs) / probs
+
+        if not torch.isclose(probs.sum(), torch.tensor(1.0)):
+            raise ValueError("Probs must sum to 1.")
+
+        self.probs = probs.float()
+
+        if isinstance(prior, (float, int)):
+            self.prior = prior * torch.ones_like(self.probs).float()
+        elif prior.shape == probs.shape:
+            self.prior = prior.float()
+        else:
+            raise ValueError("Invalid prior. Ensure shape equals the shape of"
+                             " the probs provided.")
+
+        if isinstance(mean, (int, float)):
+            means = torch.tensor([mean]).float()
+        else:
+            raise ValueError("Mean must be a float.")
+
+        if isinstance(prec, (int, float)):
+            precs = prec * torch.ones_like(means)
+        else:
+            raise ValueError("prec must be a float.")
+
+        if means.shape != precs.shape:
+            raise ValueError("means and precs must have same shape!")
+
+        self.means = means.float()
+        self.precs = precs.float()
+
+        if isinstance(means_prior, (float, int)):
+            self.means_prior = means_prior * torch.ones_like(self.means)
+        else:
+            raise ValueError("means_prior must be a float.")
+
+        if isinstance(n0, (float, int)):
+            self.n0 = n0 * torch.tensor(1.)
+        else:
+            self.n0 = n0.float()
+
+        if isinstance(prec_alpha_prior, (float, int)):
+            self.prec_alpha_prior = prec_alpha_prior * torch.ones_like(
+                self.precs)
+        else:
+            raise ValueError("prec_alpha_prior must be a float.")
+
+        if isinstance(prec_beta_prior, (float, int)):
+            self.prec_beta_prior = prec_beta_prior * torch.ones_like(
+                self.precs)
+        else:
+            raise ValueError("prec_beta_prior must be a float.")
+
+        self.to(device)
+
+    def init_params_random(self) -> None:
+        """
+        Randomly samples and sets model parameters from the Dirchlet prior.
+        """
+        self.probs = Dirichlet(self.prior).sample()
+        prec_m = Gamma(self.prec_alpha_prior,
+                       self.prec_beta_prior)
+        self.precs = prec_m.sample()
+
+        means_m = MultivariateNormal(loc=self.means_prior,
+                                     precision_matrix=(self.n0 *
+                                                       self.prec_alpha_prior /
+                                                       self.prec_beta_prior
+                                                       ).diag())
+        self.means = means_m.sample()
+
+    def sample(self,
+               sample_shape: Optional[Tuple[int]] = None) -> torch.Tensor:
+        """
+        Draws samples from this model and returns them in a tensor with the
+        specified shape.  If no shape is provided, then a single sample is
+        returned.
+        """
+        if sample_shape is None:
+            sample_shape = torch.tensor([1], device=self.device)
+
+        discrete = Categorical(probs=self.probs).sample(sample_shape)
+        continuous = MultivariateNormal(
+            loc=self.means,
+            precision_matrix=self.precs.abs().diag()).sample(sample_shape)
+
+        return torch.stack((discrete.unsqueeze(-1), continuous), -1).squeeze()
+
+    def to(self, device) -> None:
+        self.probs = self.probs.to(device)
+        self.prior = self.prior.to(device)
+
+        self.means = self.means.to(device)
+        self.precs = self.precs.to(device)
+
+        self.means_prior = self.means_prior.to(device)
+        self.prec_alpha_prior = self.prec_alpha_prior.to(device)
+        self.prec_beta_prior = self.prec_alpha_prior.to(device)
+        self.n0 = self.n0.to(device)
+
+        self.device = device
+
+    def log_parameters_prob(self) -> torch.Tensor:
+        ll = Gamma(self.prec_alpha_prior,
+                   self.prec_beta_prior).log_prob(self.precs.abs()).sum()
+        ll += MultivariateNormal(
+            loc=self.means_prior,
+            precision_matrix=(self.n0 *
+                              self.precs.abs()).diag()).log_prob(self.means)
+        return ll + Dirichlet(self.prior).log_prob(self.probs)
+
+    def log_prob(self, value: torch.Tensor) -> torch.Tensor:
+        ll = Categorical(probs=self.probs).log_prob(value[:, 0].int()).sum()
+        ll += MultivariateNormal(
+                loc=self.means,
+                precision_matrix=self.precs.abs().diag()
+                ).log_prob(value[:, 1].unsqueeze(-1)).sum()
+        return ll
+
+    def parameters(self) -> List[Union[torch.Tensor]]:
+        return [self.probs.clone().detach(), self.means.clone().detach(),
+                self.precs.clone().detach()]
+
+    def set_parameters(self, params: List[Union[torch.Tensor, list]]) -> None:
+        probs = params[0]
+        self.means = params[1]
+        self.precs = params[2]
+
+        if not torch.isclose(probs.sum(), torch.tensor(1.0)):
+            raise ValueError("Probs must sum to 1.")
+
+        self.probs = probs
+
+    def fit(self, X: torch.Tensor) -> None:
+        counts = X[:, 0].int().bincount(minlength=self.probs.shape[0]).float()
+        self.probs = (counts + self.prior) / (counts.sum() + self.prior.sum())
+
+        # if X[:, 1].shape[0] != self.means.shape[0]:
+        #     raise ValueError("Mismatch in number of features.")
+
+        n = X[:, 1].shape[0]
+
+        if n == 0:
+            self.means = self.means_prior
+            self.precs = self.prec_alpha_prior / self.prec_beta_prior
+        elif n > 0:
+            means = X[:, 1].mean(0)
+            self.means = ((self.n0 * self.means_prior + n * means) /
+                          (self.n0 + n))
+            alpha = self.prec_alpha_prior + n / 2
+            sq_error = (X[:, 1] - means).pow(2)
+            beta = (self.prec_beta_prior +
+                    0.5 * sq_error.sum(0) +
+                    (n * self.n0) * (means - self.means_prior).pow(2) /
+                    (2 * (n + self.n0)))
+            self.precs = alpha / beta
+
+
 class CategoricalModel(Model):
     """
     A model used for representing discrete outputs from a state in the HMM.

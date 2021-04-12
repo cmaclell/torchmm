@@ -5,6 +5,7 @@ from torch.nn.utils.rnn import pad_packed_sequence
 
 from torchmm.base import CategoricalModel
 from torchmm.base import DiagNormalModel
+from torchmm.base import MixedModel
 from torchmm.hmm_packed import HiddenMarkovModel
 from torchmm.utils import pack_list
 
@@ -425,3 +426,45 @@ def test_hmm_fit_viterbi_diagnormal():
     accuracy = torch.mean(torch.abs(pred.data - true.data).float())
     print("Accuracy: ", accuracy)
     assert accuracy >= 0.9 or accuracy <= 0.1
+
+
+def test_hmm_fit_viterbi_mixed():
+
+    T0 = torch.tensor([0.75, 0.25])
+    T = torch.tensor([[0.85, 0.15],
+                      [0.12, 0.88]])
+    s1 = MixedModel(probs=torch.tensor([0.1, 0.7, 0.2]),
+                    mean=0.0, prec=1.0)
+    s2 = MixedModel(probs=torch.tensor([0.7, 0.2, 0.1]),
+                    mean=2.0, prec=1.0)
+    model = HiddenMarkovModel([s1, s2], T0=T0, T=T)
+
+    obs_seq = pack_list([torch.tensor([[0, 1.2], [1, 1.5], [2, 7.8], [1, 1.6]]),
+                         torch.tensor([[1, 1.4], [2, 1.2], [0, 7.2], [2, 1.1]])])
+
+    converge = model.fit(obs_seq, max_steps=500,
+                         epsilon=1e-2, restarts=3)
+
+    # Not enough samples (only 1) to test
+    # assert np.allclose(trans0.data.numpy(), True_pi)
+    print("Pi Matrix: ")
+    print(model.T0)
+
+    print("Transition Matrix: ")
+    print(model.T)
+    # assert np.allclose(transition.exp().data.numpy(), True_T, atol=0.1)
+    print()
+    print("Emission: ")
+    for s in model.states:
+        p = list(s.parameters())
+        print("Probs", p[0])
+        print("Means", p[1])
+        print("Cov", p[2].abs())
+    # assert np.allclose(emission.exp().data.numpy(), True_E, atol=0.1)
+    print()
+    print("Reached Convergence: ")
+    print(converge)
+
+    assert converge
+
+    states_seq, _ = model.decode(obs_seq)
